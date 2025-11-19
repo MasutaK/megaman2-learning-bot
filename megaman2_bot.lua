@@ -1,15 +1,16 @@
 -- megaman2_bot.lua
--- Q-learning agent for Mega Man 2 (FCEUX) with per-room Q-tables, progress graph, and blocked detection
+-- Learning agent for Mega Man 2 (FCEUX)
 
 -- ========== CONFIG ==========
 local Q_SAVE_PREFIX = "mm2_qtable_room_"
 local LOG_FILE = "mm2_qlog.csv"
 
 -- RAM addresses
-local ADDR_X = 0x0460
-local ADDR_Y = 0x04A0
-local ADDR_HP = 0x06C0
-local ADDR_SCROLL_STAT = 0x001E
+local ADDR_X      = 0x0460
+local ADDR_Y      = 0x04A0
+local ADDR_HP     = 0x06C0
+local ADDR_SCROLL = 0x001E
+local ADDR_LADDER = 0x04F8   -- 1 = on ladder
 
 -- learning params
 local ALPHA = 0.2
@@ -18,35 +19,50 @@ local EPSILON = 0.6
 local EPS_DECAY = 0.99995
 local EPS_MIN = 0.05
 
--- state discretization
+-- discretization
 local X_BUCKETS = 16
 local Y_BUCKETS = 8
 local HP_BUCKETS = 4
 
 -- reward shaping
-local TIME_PENALTY = 0.01
+local TIME_PENALTY = 10
 local DEATH_PENALTY = -50
-local PROGRESS_SCALE = 1.0
+local PROGRESS_SCALE = 100
 
--- save / log frequency
+-- save/log frequency
 local SAVE_EVERY = 5000
 local LOG_EVERY = 1200
-local BLOCKED_CHECK_FRAMES = 15
+local BLOCKED_CHECK_FRAMES = 1000
 local BLOCKED_DELTA_THRESHOLD = 1
 
--- actions
+-- action cooldown (important to avoid spamming inputs)
+local ACTION_COOLDOWN = 6
+local action_timer = 0
+local last_action = 1
+
+-- ============================================
+-- ACTIONS (with ladder support)
+-- ============================================
 local ACTIONS = {
     {name="NONE", map={}},
-    {name="RIGHT", map={["right"]=true}},
-    {name="LEFT",  map={["left"]=true}},
-    {name="JUMP",  map={["A"]=true}},
-    {name="SHOOT", map={["B"]=true}},
-    {name="JUMP_RIGHT", map={["A"]=true, ["right"]=true}},
+
+    {name="RIGHT", map={right=true}},
+    {name="LEFT",  map={left=true}},
+    {name="JUMP",  map={A=true}},
+    {name="SHOOT", map={B=true}},
+    {name="JUMP_RIGHT", map={A=true, right=true}},
+
+    -- ladder actions
+    {name="UP",        map={up=true}},
+    {name="DOWN",      map={down=true}},
+    {name="UP_RIGHT",  map={up=true, right=true}},
+    {name="UP_LEFT",   map={up=true, left=true}},
+    {name="JUMP_UP",   map={A=true, up=true}}, -- grab ladder bottom
 }
 
--- ----------------------------------------
+------------------------------------------------
 -- STATE & RESET
--- ----------------------------------------
+------------------------------------------------
 local MIN_LIFE = 1
 local death_wait_frames = 0
 local episode = 1
@@ -54,29 +70,46 @@ local episode = 1
 local room_start_state = savestate.create()
 savestate.save(room_start_state)
 
--- ----------------------------------------
+------------------------------------------------
 -- HELPERS
--- ----------------------------------------
-local function get_bucket(val, maxval, buckets)
-    local b = math.floor((val / (maxval + 1)) * buckets)
+------------------------------------------------
+local function r(addr) return memory.readbyte(addr) or 0 end
+
+local function get_bucket(v, maxv, buckets)
+    local b = math.floor((v / (maxv + 1)) * buckets)
     if b < 0 then b = 0 end
     if b >= buckets then b = buckets - 1 end
     return b
 end
-local function r(addr) return memory.readbyte(addr) or 0 end
-local function state_to_key(xb, yb, hpb, sstat)
-    return tostring(xb) .. "_" .. tostring(yb) .. "_" .. tostring(hpb) .. "_" .. tostring(sstat)
+
+local function state_to_key(xb, yb, hpb, scroll)
+    return tostring(xb) .. "_" .. tostring(yb) .. "_" .. tostring(hpb) .. "_" .. tostring(scroll)
 end
 
--- ----------------------------------------
--- Q-tables per room
--- ----------------------------------------
+-- Ladder detection (universal)
+local function is_on_ladder()
+    return r(ADDR_LADDER) == 1
+end
+
+-- Universal ladder bottom detector (approx, works across stages)
+-- Slightly generous alignment window to allow the agent to learn alignment too.
+local function can_grab_ladder_bottom(x, y)
+    local tx = x % 16
+    local aligned = (tx >= 5 and tx <= 11) -- slightly wider tolerance
+    -- Broad Y window to cover many rooms; the agent will learn precise alignment via Q.
+    local y_ok = (y >= 100 and y <= 180)
+    return aligned and y_ok
+end
+
+------------------------------------------------
+-- Q-TABLES
+------------------------------------------------
 local Q_rooms = {}
 
-local function save_qtable_room(room_id)
-    local Q = Q_rooms[room_id]
+local function save_qtable_room(id)
+    local Q = Q_rooms[id]
     if not Q then return end
-    local f = io.open(Q_SAVE_PREFIX .. room_id .. ".csv", "w")
+    local f = io.open(Q_SAVE_PREFIX..id..".csv","w")
     if not f then return end
     for k, tab in pairs(Q) do
         for ai, qv in pairs(tab) do
@@ -86,10 +119,10 @@ local function save_qtable_room(room_id)
     f:close()
 end
 
-local function load_qtable_room(room_id)
-    local f = io.open(Q_SAVE_PREFIX .. room_id .. ".csv", "r")
-    Q_rooms[room_id] = Q_rooms[room_id] or {}
-    local Q = Q_rooms[room_id]
+local function load_qtable_room(id)
+    Q_rooms[id] = Q_rooms[id] or {}
+    local Q = Q_rooms[id]
+    local f = io.open(Q_SAVE_PREFIX..id..".csv","r")
     if not f then return end
     for line in f:lines() do
         local k, ai, qv = line:match("([^,]+),([^,]+),([^,]+)")
@@ -103,31 +136,14 @@ local function load_qtable_room(room_id)
     f:close()
 end
 
--- ----------------------------------------
--- Q-learning helpers
--- ----------------------------------------
-local function choose_action(key, epsilon, room_id)
-    local Q = Q_rooms[room_id]
+------------------------------------------------
+-- Q-LEARNING
+------------------------------------------------
+local function max_q(key, room)
+    local Q = Q_rooms[room]
+    if not Q then return 0 end
     local tab = Q[key]
-    if math.random() < epsilon or tab == nil then
-        return math.random(1, #ACTIONS), true
-    end
-    local best_ai = 1
-    local best_q = -1e9
-    for ai = 1, #ACTIONS do
-        local qv = tab[ai] or 0
-        if qv > best_q then
-            best_q = qv
-            best_ai = ai
-        end
-    end
-    return best_ai, false
-end
-
-local function max_q(key, room_id)
-    local Q = Q_rooms[room_id]
-    local tab = Q[key]
-    if tab == nil then return 0 end
+    if not tab then return 0 end
     local best = -1e9
     for ai = 1, #ACTIONS do
         local qv = tab[ai] or 0
@@ -137,78 +153,151 @@ local function max_q(key, room_id)
     return best
 end
 
-local function update_q(s_key, ai, reward, s2_key, room_id)
-    local Q = Q_rooms[room_id]
+-- Ladder-aware action selector
+local function choose_action(key, eps, room, x, y)
+    local on_ladder = is_on_ladder()
+    local can_down  = can_grab_ladder_bottom(x, y)
+
+    local allowed = {}
+
+    if on_ladder then
+        -- allow vertical ladder movement + option to step off horizontally or do nothing
+        for i,a in ipairs(ACTIONS) do
+            if a.name=="UP" or a.name=="DOWN" or a.name=="UP_RIGHT" or a.name=="UP_LEFT" or a.name=="NONE" then
+                table.insert(allowed, i)
+            end
+        end
+
+        -- ensure left/right are available to exit ladder horizontally if needed
+        for i,a in ipairs(ACTIONS) do
+            if a.name=="LEFT" or a.name=="RIGHT" then
+                table.insert(allowed, i)
+            end
+        end
+
+    elseif can_down then
+        -- at bottom alignment: allow JUMP_UP to grab ladder and DOWN to attach (and a small number of movement tries)
+        for i,a in ipairs(ACTIONS) do
+            if a.name=="DOWN" or a.name=="JUMP_UP" or a.name=="LEFT" or a.name=="RIGHT" or a.name=="NONE" then
+                table.insert(allowed, i)
+            end
+        end
+
+    else
+        -- normal ground behavior: forbid ladder-only inputs to avoid accidental presses
+        for i,a in ipairs(ACTIONS) do
+            if a.name~="UP" and a.name~="DOWN" and a.name~="UP_RIGHT" and a.name~="UP_LEFT" and a.name~="JUMP_UP" then
+                table.insert(allowed, i)
+            end
+        end
+    end
+
+    -- safety fallback: allow everything if somehow empty
+    if #allowed == 0 then
+        for i=1,#ACTIONS do table.insert(allowed, i) end
+    end
+
+    local Q = Q_rooms[room]
+    local tab = Q and Q[key] or nil
+
+    -- exploration
+    if math.random() < eps or tab == nil then
+        return allowed[math.random(#allowed)], true
+    end
+
+    -- exploitation among allowed actions
+    local best_ai = allowed[1]
+    local best_q = -1e9
+    for _, ai in ipairs(allowed) do
+        local qv = tab[ai] or 0
+        if qv > best_q then
+            best_q = qv
+            best_ai = ai
+        end
+    end
+    return best_ai, false
+end
+
+local function update_q(s_key, ai, reward, s2_key, room)
+    local Q = Q_rooms[room]
     Q[s_key] = Q[s_key] or {}
     local q = Q[s_key][ai] or 0
-    local target = reward + GAMMA * max_q(s2_key, room_id)
+    local target = reward + GAMMA * max_q(s2_key, room)
     local newq = q + ALPHA * (target - q)
     Q[s_key][ai] = newq
 end
 
--- ----------------------------------------
--- Logging
--- ----------------------------------------
-local logf = io.open(LOG_FILE, "a")
-if logf then logf:write("frame,xb,yb,hb,sstat,action,reward,epsilon,episode,room,explore\n") end
+------------------------------------------------
+-- LOG FILE
+------------------------------------------------
+local logf = io.open(LOG_FILE,"a")
+if logf then
+    logf:write("frame,xb,yb,hpb,scr,ladder,action,reward,eps,episode,room,explore\n")
+end
 
--- ----------------------------------------
--- State helpers
--- ----------------------------------------
-local frame = 0
-local eps = EPSILON
+------------------------------------------------
+-- STATE EXTRACTION
+------------------------------------------------
 local function get_state_key()
     local x = r(ADDR_X)
     local y = r(ADDR_Y)
     local hp = r(ADDR_HP)
-    local sstat = r(ADDR_SCROLL_STAT)
-    local xb = get_bucket(x,255,X_BUCKETS)
-    local yb = get_bucket(y,255,Y_BUCKETS)
+    local sc = r(ADDR_SCROLL)
+    local xb  = get_bucket(x,255,X_BUCKETS)
+    local yb  = get_bucket(y,255,Y_BUCKETS)
     local hpb = get_bucket(hp,255,HP_BUCKETS)
-    return state_to_key(xb,yb,hpb,sstat), xb, yb, hpb, sstat, x, y, hp
+    return state_to_key(xb,yb,hpb,sc), xb, yb, hpb, sc, x, y, hp
 end
 
--- ----------------------------------------
--- INITIAL STATE
--- ----------------------------------------
-local current_action = 1
-local explore = false
-local s_key, xb, yb, hpb, sstat, cur_x, cur_y, cur_hp = get_state_key()
-local cur_room = r(ADDR_SCROLL_STAT)
-Q_rooms[cur_room] = Q_rooms[cur_room] or {}
-load_qtable_room(cur_room)
-current_action, explore = choose_action(s_key, eps, cur_room)
-
--- ----------------------------------------
+------------------------------------------------
 -- BLOCKED DETECTION
--- ----------------------------------------
+------------------------------------------------
 local last_positions = {}
+
 local function is_blocked(nx, ny)
     table.insert(last_positions, {x=nx, y=ny})
     if #last_positions > BLOCKED_CHECK_FRAMES then
         table.remove(last_positions, 1)
     end
-    local min_x, max_x = last_positions[1].x, last_positions[1].x
-    local min_y, max_y = last_positions[1].y, last_positions[1].y
-    for _, pos in ipairs(last_positions) do
-        if pos.x < min_x then min_x = pos.x end
-        if pos.x > max_x then max_x = pos.x end
-        if pos.y < min_y then min_y = pos.y end
-        if pos.y > max_y then max_y = pos.y end
+
+    local minx, maxx = last_positions[1].x, last_positions[1].x
+    local miny, maxy = last_positions[1].y, last_positions[1].y
+    for _, p in ipairs(last_positions) do
+        if p.x < minx then minx = p.x end
+        if p.x > maxx then maxx = p.x end
+        if p.y < miny then miny = p.y end
+        if p.y > maxy then maxy = p.y end
     end
-    local dx = max_x - min_x
-    local dy = max_y - min_y
+
+    local dx = maxx - minx
+    local dy = maxy - miny
     return (dx <= BLOCKED_DELTA_THRESHOLD and dy <= BLOCKED_DELTA_THRESHOLD)
 end
 
--- ----------------------------------------
+------------------------------------------------
+-- INITIAL STATE
+------------------------------------------------
+local frame = 0
+local eps = EPSILON
+local s_key, xb, yb, hpb, sstat, cur_x, cur_y, cur_hp = get_state_key()
+local cur_room = r(ADDR_SCROLL)
+
+Q_rooms[cur_room] = Q_rooms[cur_room] or {}
+load_qtable_room(cur_room)
+
+-- select initial action and start cooldown
+local current_action, explore = choose_action(s_key, eps, cur_room, cur_x, cur_y)
+last_action = current_action
+action_timer = ACTION_COOLDOWN
+
+------------------------------------------------
 -- MAIN LOOP
--- ----------------------------------------
+------------------------------------------------
 while true do
     frame = frame + 1
 
-    -- detect room change
-    local new_room = r(ADDR_SCROLL_STAT)
+    -- room change
+    local new_room = r(ADDR_SCROLL)
     if new_room ~= cur_room then
         cur_room = new_room
         Q_rooms[cur_room] = Q_rooms[cur_room] or {}
@@ -219,7 +308,7 @@ while true do
         print(string.format(">>> New room detected. Room ID: %d", cur_room))
     end
 
-    -- detect death
+    -- death handling
     local hp = r(ADDR_HP)
     if hp <= MIN_LIFE then
         death_wait_frames = death_wait_frames + 1
@@ -230,75 +319,84 @@ while true do
             emu.frameadvance()
             death_wait_frames = 0
             s_key, xb, yb, hpb, sstat, cur_x, cur_y, cur_hp = get_state_key()
-            current_action, explore = choose_action(s_key, eps, cur_room)
+            current_action, explore = choose_action(s_key, eps, cur_room, cur_x, cur_y)
+            last_action = current_action
+            action_timer = ACTION_COOLDOWN
             last_positions = {}
         end
+
     else
         death_wait_frames = 0
 
-        -- execute action
-        local act = ACTIONS[current_action]
-        joypad.set(1, act.map)
+        -- ACTION SELECTION WITH COOLDOWN
+        action_timer = action_timer - 1
+        if action_timer <= 0 then
+            -- pick a new action based on current observed state
+            current_action, explore = choose_action(s_key, eps, cur_room, cur_x, cur_y)
+            last_action = current_action
+            action_timer = ACTION_COOLDOWN
+        else
+            -- keep applying last_action while timer > 0
+            current_action = last_action
+        end
+
+        -- execute action (applied every frame while held)
+        joypad.set(1, ACTIONS[current_action].map)
         emu.frameadvance()
 
         -- next state
         local s2_key, xb2, yb2, hpb2, sstat2, nx, ny, nhp = get_state_key()
+        local ladder_flag = is_on_ladder() and 1 or 0
 
         -- reward
-        local delta_x = nx - cur_x
-        if delta_x < -128 then delta_x = delta_x + 256 end
-        local reward = PROGRESS_SCALE * delta_x - TIME_PENALTY
+        local dx = nx - cur_x
+        if dx < -128 then dx = dx + 256 end
+        local reward = PROGRESS_SCALE * dx - TIME_PENALTY
         if nhp < cur_hp then reward = reward + DEATH_PENALTY end
 
         -- blocked check
         if is_blocked(nx, ny) then
             reward = reward - 1.0
-            current_action, explore = choose_action(s_key, 1.0, cur_room) -- full exploration
+            -- force exploration and reset cooldown so new exploratory input actually holds
+            current_action, explore = choose_action(s_key, 1.0, cur_room, nx, ny)
+            last_action = current_action
+            action_timer = ACTION_COOLDOWN
         else
-            current_action, explore = choose_action(s2_key, eps, cur_room)
+            -- if not blocked, consider next action when timer expires (we already scheduled it above)
         end
 
-        -- update Q
+        -- update Q-table
         update_q(s_key, current_action, reward, s2_key, cur_room)
 
         -- decay epsilon
         eps = math.max(EPS_MIN, eps * EPS_DECAY)
 
-        -- log periodically
+        -- periodic logging
         if frame % LOG_EVERY == 0 and logf then
-            logf:write(string.format("%d,%d,%d,%d,%d,%s,%.4f,%.4f,%d,%d,%d\n",
-                frame, xb2, yb2, hpb2, sstat2, ACTIONS[current_action].name, reward, eps, episode, cur_room, explore and 1 or 0))
+            logf:write(string.format("%d,%d,%d,%d,%d,%d,%s,%.4f,%.4f,%d,%d,%d\n",
+                frame, xb2, yb2, hpb2, sstat2, ladder_flag,
+                ACTIONS[current_action].name, reward, eps, episode, cur_room, explore and 1 or 0))
             logf:flush()
         end
 
-        -- save all Q-tables periodically
+        -- periodic save
         if frame % SAVE_EVERY == 0 then
-            for room_id,_ in pairs(Q_rooms) do
-                save_qtable_room(room_id)
+            for id,_ in pairs(Q_rooms) do
+                save_qtable_room(id)
             end
         end
 
-        -- prepare next iteration
+        -- prepare next iter
         s_key = s2_key
         cur_x = nx; cur_y = ny; cur_hp = nhp
 
-        -- overlay graphics
+        -- HUD
         gui.text(6,10,string.format("MM2 Q-learning | frame:%d eps:%.3f", frame, eps))
         gui.text(6,24,string.format("Episode: %d", episode))
         gui.text(6,38,string.format("Room ID: %d", cur_room))
-        gui.text(6,52,string.format("Action: %s", ACTIONS[current_action].name))
-        gui.text(6,66,string.format("State xb:%d yb:%d hpb:%d sstat:%d", xb2, yb2, hpb2, sstat2))
+        gui.text(6,52,string.format("Action: %s (%d)", ACTIONS[current_action].name, current_action))
+        gui.text(6,66,string.format("State xb:%d yb:%d hpb:%d scr:%d", xb2, yb2, hpb2, sstat2))
         gui.text(6,82,string.format("Reward: %.3f", reward))
-
-        -- mini graph for exploration vs exploitation
-        local bar_width = 50
-        local explore_len = math.floor(bar_width * (explore and 1 or 0))
-        gui.box(6, 98, 6 + bar_width, 102, 0xFF000000, 0xFF4444FF)
-        if explore then
-            gui.box(6, 98, 6 + explore_len, 102, 0xFF4444FF, 0xFF4444FF)
-        else
-            gui.box(6, 98, 6 + bar_width, 102, 0xFF44FF44, 0xFF44FF44)
-        end
     end
 end
 
